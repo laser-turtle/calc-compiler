@@ -1,0 +1,2 @@
+## How to use
+Build with `dune build`, run with `./_build/default/bin/main.exe`. The generated executable will be a file called `my_exe` in the directory that you ran the executable from. The REPL runs this executable after generating it and prints the return code. The return code should be the result of the expression entered. See the [blog post](https://laserturtle.net/posts/build-a-compiler) for more information.
