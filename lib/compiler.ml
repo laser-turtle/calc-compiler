@@ -7,83 +7,10 @@ type op = Add
 
 type exp = Op of op * exp list
          | Num of int
+         | Def of string * exp
+         | Var of string
 
 type ast = exp list
-
-type token = LParen
-           | RParen
-           | Int of int
-           | String of string
-
-(* Parse a single integer *)
-let parse_int lst = 
-    let rec loop acc = function
-        | ('0'..'9' as digit) :: rest -> 
-            loop (digit :: acc) rest
-
-        | [] as rest
-        | rest -> 
-            let num = String.of_char_list (List.rev acc) in
-            Int (Int.of_string num), rest
-    in
-    loop [] lst
-;;
-
-let string_of_chars chars =
-    let str = String.of_char_list (List.rev chars) in
-    String str
-;;
-
-(* Parse multiple characters into a string *)
-let parse_string lst =
-    let rec loop acc = function
-        | [] as rest ->
-            string_of_chars acc, rest
-
-        | ('0'..'9' | '(' | ')' | ' ' | '\t' | '\n' | '\r' as hd) :: rest ->
-            string_of_chars acc, hd :: rest
-
-        | hd :: rest -> 
-            loop (hd :: acc) rest
-    in
-    loop [] lst
-;;
-
-
-(** Turn a string into a token list *)
-let tokenize (input : string) : token list =
-    let chars = String.to_list input in
-
-    (* Top-level loop to parse entire string *)
-    let rec loop acc = function
-        | [] -> acc
-
-        (* skip whitespace *)
-        | ' ' :: rest
-        | '\t' :: rest
-        | '\n' :: rest
-        | '\r' :: rest -> loop acc rest
-
-        (* parentheses *)
-        | '(' :: rest -> loop (LParen :: acc) rest
-        | ')' :: rest -> loop (RParen :: acc) rest
-
-        (* integers *)
-        | ('0'..'9' as hd) :: rest -> 
-            let num, rest = parse_int (hd :: rest) in
-            loop (num :: acc) rest
-
-        (* string *)
-        | hd :: rest -> 
-            let str, rest = parse_string (hd :: rest) in
-            loop (str :: acc) rest
-    in
-
-    (* Run the loop *)
-    chars
-    |> loop []
-    |> List.rev
-;;
 
 let parse_op = function
     | "+" -> Add
@@ -93,51 +20,75 @@ let parse_op = function
     | _ -> failwith "Invalid op"
 ;;
 
-let build_ast (lst : token list) : ast =
-    let rec parse_operator (lst : token list) : exp * token list =
-        match lst with
-        | String s :: rest ->
-            let op = parse_op s in
+let is_int n =
+    match Int.of_string n with
+    | _ -> true
+    | exception _ -> false
+;;
 
-            let rec loop acc = function
-                | [] -> failwith "Expected right paren"
-                | RParen :: rest -> acc, rest
-                | rest ->
-                    let exp, rest = parse_exp [] rest in
-                    loop (acc @ exp) rest
-            in
-            let exprs, rest = loop [] rest in
-            Op (op, List.rev exprs), rest
+let build_ast (lst : Sexp.t list) : ast =
+    let open Sexp in
 
-        | _ -> failwith "Cannot parse input"
-
-    and parse_exp acc : token list -> exp list * token list = function
+    (* Two-level parsing, so we only allow defining variables at the top-level *)
+    let rec parse_top_level acc : Sexp.t list -> exp list * Sexp.t list = function
         (* End of input, success *)
         | [] -> List.rev acc, []
 
-        (* Start of an operator *)
-        | LParen :: (String _ as op) :: rest -> 
-            let op, rest = parse_operator (op :: rest) in
-            parse_exp (op :: acc) rest
+        (* Variable definition *)
+        | List [Atom "define"; Atom var; exp] :: rest ->
+            let value, _ = parse_exp [] [exp] in
+            let exp = Def (var, List.hd_exn value) in
+            parse_top_level (exp :: acc) rest
 
-        (* End of operator *)
-        | RParen :: rest ->
-            acc, RParen :: rest
+        | List (Atom "define" :: _) :: _ ->
+            failwith "Error with define"
+
+        (* Forward to sub expression *)
+        | exp :: rest -> 
+            let exp, _ = parse_exp [] [exp] in
+            parse_top_level (List.hd_exn exp :: acc) rest
+
+    and parse_exp acc : Sexp.t list -> exp list * Sexp.t list = function
+        (* End of input, success *)
+        | [] -> List.rev acc, []
 
         (* Integer *)
-        | Int i :: rest -> 
-            parse_exp (Num i :: acc) rest
+        | Atom i :: rest when is_int i -> 
+            parse_exp (Num (Int.of_string i) :: acc) rest
+
+        (* Can't have a nested variable definition *)
+        | List (Atom "define" :: _) :: _ ->
+            failwith "Variables must be defined at the top level"
+
+        (* Not an integer? probably a var *)
+        | Atom var :: rest ->
+            parse_exp (Var var :: acc) rest
+
+        (* Operator *)
+        | List (Atom ("+" as op) :: args) :: rest
+        | List (Atom ("-" as op) :: args) :: rest
+        | List (Atom ("*" as op) :: args) :: rest
+        | List (Atom ("/" as op) :: args) :: rest ->
+            let args = 
+                args
+                |> List.map ~f:(fun a -> parse_exp [] [a])
+                |> List.map ~f:fst
+                |> List.map ~f:List.hd_exn
+            in
+            let exp = Op (parse_op op, args) in
+            parse_exp (exp :: acc) rest
 
         (* Error *)
-        | _ -> failwith "Error parsing input"
+        | e -> 
+            List.iter ~f:(fun e -> print_endline (Sexp.to_string e)) e;
+            failwith "Error parsing input"
     in
 
-    parse_exp [] lst |> fst
+    parse_top_level [] lst |> fst
 ;;
 
 let eval (ast : ast) =
-    (* Only return the last expression's result *)
-    let last = List.last_exn ast in
+    let env = Hashtbl.Poly.create () in
 
     let rec compute : exp -> int = 
         let reduce op exps =
@@ -150,9 +101,14 @@ let eval (ast : ast) =
         | Op (Mul, exps) -> reduce ( * ) exps
         | Op (Div, exps) -> reduce ( / ) exps
         | Num num -> num
+        | Var var -> Hashtbl.find_exn env var
+        | Def (var, exp) -> 
+            let value = compute exp in
+            Hashtbl.set env ~key:var ~data:value;
+            value
     in
 
-    compute last
+    List.fold ~init:0 ~f:(fun _ e -> compute e) ast
 ;;
 
 let gen_code (ast : ast) =
@@ -174,6 +130,7 @@ let gen_code (ast : ast) =
                 let r = normalize r in
                 Op (op, [l; r])
             ) exps
+        | _ -> failwith "Unhandled normalize"
     in
     
     let open Instructions in
@@ -217,6 +174,7 @@ let gen_code (ast : ast) =
             push RCX 
             :: mov_const ~dst:RCX ~const:num 
             :: instrs
+        | _ -> failwith "Unhandled normalize"
     in
 
     let instrs = compute [] (normalize last) in
@@ -228,10 +186,17 @@ let gen_code (ast : ast) =
 
 let compile (input : string) =
     input
-    |> tokenize
+    |> Sexp.of_string_many
     |> build_ast
     |> gen_code
     |> Elf.write_file
+;;
+
+let run (input : string) =
+    input
+    |> Sexp.of_string_many
+    |> build_ast
+    |> eval
 ;;
 
 let rec repl() =
@@ -241,13 +206,17 @@ let rec repl() =
     | None -> ()
     | Some line ->
         try
+            (*
             compile line;
             Caml.Sys.command "chmod +x my_exe" |> ignore;
             let result = Caml.Sys.command "./my_exe" in
             print_endline (Int.to_string result);
+            *)
+            print_endline (Int.to_string (run line));
             repl();
-        with _ -> (
+        with e -> (
             print_endline "Error";
+            print_endline (Exn.to_string e);
             repl();
         )
 ;;
