@@ -4,11 +4,13 @@ type op = Add
         | Sub
         | Mul
         | Div
+        [@@deriving show {with_path = false}]
 
 type exp = Op of op * exp list
          | Num of int
          | Def of string * exp
          | Var of string
+         [@@deriving show {with_path = false}]
 
 type ast = exp list
 
@@ -111,8 +113,42 @@ let eval (ast : ast) =
     List.fold ~init:0 ~f:(fun _ e -> compute e) ast
 ;;
 
-let gen_code (ast : ast) =
-    let last = List.last_exn ast in
+(* We only have numbers to worry about right now *)
+let sizeof (_ : exp) = 8
+
+type location_info = {
+    locations : (string, int) Base.Hashtbl.t;
+    total_size : int;
+}
+
+let allocate_variables (ast : ast) : location_info =
+    (* Read the number of top-level defines, and 
+       allocate a spot for each one of them *)
+    let offset = ref Elf.base_data_address in
+    let total_size = ref 0 in
+    let locations = Hashtbl.Poly.create () in
+    List.iter ~f:(function
+        | Def (var, exp) ->
+            Hashtbl.update locations var ~f:(function
+                | Some o -> o
+                | None ->
+                    let sz = sizeof exp in
+                    let off = !offset in
+                    offset := !offset + sz;
+                    total_size := !total_size + sz; 
+                    off
+            )
+        | _ -> ()
+    ) ast;
+    { locations; total_size = !total_size }
+;;
+
+let gen_code (ast : ast) : Elf.code =
+    (* Need to pre-calculate all the variables and sizes 
+       can have an expression that is "sizeof exp" that
+       returns the number of bytes to allocate
+     *)
+    let { locations; total_size } = allocate_variables ast in
 
     let rec normalize exp =
         match exp with
@@ -130,7 +166,8 @@ let gen_code (ast : ast) =
                 let r = normalize r in
                 Op (op, [l; r])
             ) exps
-        | _ -> failwith "Unhandled normalize"
+        | Var _ as op -> op
+        | Def (name, exp) -> Def (name, normalize exp)
     in
     
     let open Instructions in
@@ -148,6 +185,20 @@ let gen_code (ast : ast) =
         in
 
         function
+        (* Variables *)
+        | Def (name, exp) ->
+            let v = compute [] exp in
+            let loc = Hashtbl.Poly.find_exn locations name in
+            [
+                save ~src:RCX ~addr:loc;
+                pop RCX;
+            ]
+            @ v
+        (* Variable reference *)
+        | Var name ->
+            let loc = Hashtbl.Poly.find_exn locations name in
+            [push RCX;
+            load ~dst:RCX ~addr:loc]
         (* Two's complement negation *)
         | Op (Sub, [exp]) ->
             let v = compute [] exp in
@@ -174,14 +225,19 @@ let gen_code (ast : ast) =
             push RCX 
             :: mov_const ~dst:RCX ~const:num 
             :: instrs
-        | _ -> failwith "Unhandled normalize"
     in
 
-    let instrs = compute [] (normalize last) in
+    let lst = List.map ~f:(fun exp -> compute [] (normalize exp)) (List.rev ast) in
+    let instrs = List.concat lst in
     let instrs = exit :: pop RBX :: mov_const ~dst:RAX ~const:1 :: instrs in
-    instrs
-    |> List.rev
-    |> List.join
+    let instructions =
+        instrs
+        |> List.rev
+        |> List.join
+    in
+    (* Zero initialize all our variables *)
+    let data = List.init total_size ~f:(fun _ -> 0x00) in
+    { instructions; data }
 ;;
 
 let compile (input : string) =
@@ -206,13 +262,11 @@ let rec repl() =
     | None -> ()
     | Some line ->
         try
-            (*
             compile line;
             Caml.Sys.command "chmod +x my_exe" |> ignore;
             let result = Caml.Sys.command "./my_exe" in
             print_endline (Int.to_string result);
-            *)
-            print_endline (Int.to_string (run line));
+            (*print_endline (Int.to_string (run line));*)
             repl();
         with e -> (
             print_endline "Error";

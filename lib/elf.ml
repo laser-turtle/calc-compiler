@@ -1,9 +1,17 @@
 open! Core
 
+type code = {
+    instructions : int list;
+    data : int list;
+}
+
+let base_address = 0x401000 + 0x40 + 0x38 + 0x38
+let base_data_address = 0x801000 + 0x40 + 0x38 + 0x38
+
 let create ~data ~instrs =
     let size = List.length data in
     let entry = Instructions.const_64i (
-        0x401000 + 0x40 + 0x38 + 0x38 + size
+        base_address + size
     ) in
     let total_size = 
         (List.length instrs + size + 0x40 + 0x38 + 0x38)
@@ -66,8 +74,8 @@ let create ~data ~instrs =
     header @ exec @ data_sect @ data @ instrs
 ;;
 
-let write_file (instrs : int list) : unit =
-    let exe = create ~data:[] ~instrs in
+let write_file (code : code) : unit =
+    let exe = create ~data:code.data ~instrs:code.instructions in
     Out_channel.with_file ~binary:true "my_exe" ~f:(fun chan ->
         List.iter ~f:(fun b ->
             Out_channel.output_byte chan b
